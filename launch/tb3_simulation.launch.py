@@ -12,8 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""This is all-in-one launch script intended for use by nav2 developers."""
-
 import os
 
 from ament_index_python.packages import get_package_share_directory
@@ -24,6 +22,9 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PythonExpression
 from launch_ros.actions import Node
+
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
 
 
 def generate_launch_description():
@@ -136,6 +137,32 @@ def generate_launch_description():
         'headless',
         default_value='False',
         description='Whether to execute gzclient)')
+    
+
+    config = os.path.join(
+            get_package_share_directory('vi_to_nav'),
+            'config',
+            'vdb_params.yaml'
+            )
+
+    print(config)
+
+    container = ComposableNodeContainer(
+        name='Container',
+        namespace='',
+        package='rclcpp_components',
+        executable='component_container',
+        composable_node_descriptions=[
+            ComposableNode(
+                package='vdb_mapping_ros2',
+                plugin='vdb_mapping_ros2::vdb_mapping_ros2_component',
+                name='vdb_mapping',
+                parameters=[config],
+            )
+        ],
+        output='screen',
+    )
+
 
     sim_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -186,6 +213,7 @@ def generate_launch_description():
     ld.add_action(declare_simulator_cmd)
     ld.add_action(declare_use_respawn_cmd)
 
+    ld.add_action(container)
     ld.add_action(sim_cmd)
 
     # Add the actions to launch all of the navigation nodes
