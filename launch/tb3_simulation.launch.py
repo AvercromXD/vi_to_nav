@@ -162,6 +162,13 @@ def generate_launch_description():
         ],
         output='screen',
     )
+    nbv = Node(
+            package='nbv_calculator',
+            executable='nbv_node',
+            name='nbv',
+            parameters = [config],
+            output='screen'
+            )
 
 
     sim_cmd = IncludeLaunchDescription(
@@ -213,7 +220,8 @@ def generate_launch_description():
     ld.add_action(declare_simulator_cmd)
     ld.add_action(declare_use_respawn_cmd)
 
-    ld.add_action(container)
+    #ld.add_action(container)
+    ld.add_action(nbv)
     ld.add_action(sim_cmd)
 
     # Add the actions to launch all of the navigation nodes

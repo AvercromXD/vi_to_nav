@@ -21,10 +21,13 @@
     accumulation_period: 0.2
 
     apply_raw_sensor_data: true
-    sources: [camera]
+    sources: [camera, camera_2]
     camera:
       topic: /camera/points
       sensor_origin_frame: camera_frame
+    camera_2:
+      topic: /camera_2/points
+      sensor_origin_frame: camera_2_frame
 
     # Remote mapping
     publish_updates: true
