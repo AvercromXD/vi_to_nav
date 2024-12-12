@@ -24,7 +24,7 @@
     sources: [camera]
     camera:
       topic: /camera/points
-      sensor_origin_frame: camera_rgb_frame
+      sensor_origin_frame: camera_frame
 
     # Remote mapping
     publish_updates: true
