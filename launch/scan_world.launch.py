@@ -136,7 +136,7 @@ def generate_launch_description():
     config = os.path.join(
             get_package_share_directory('vi_to_nav'),
             'config',
-            'vdb_params.yaml'
+            'vdb_params_virtual.yaml'
             )
 
     nbv = Node(
@@ -197,7 +197,7 @@ def generate_launch_description():
     ld.add_action(declare_simulator_cmd)
     ld.add_action(declare_use_respawn_cmd)
 
-    #ld.add_action(nbv)
+    ld.add_action(nbv)
     ld.add_action(sim_cmd)
 
     ld.add_action(rviz_cmd)
