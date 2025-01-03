@@ -6,9 +6,13 @@ from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
 from tf2_ros import LookupException, ExtrapolationException, TransformException
 import tf2_geometry_msgs
-from geometry_msgs.msg import Transform, Pose
+from geometry_msgs.msg import Transform, Pose, PoseStamped
+from std_msgs.msg import Header
 import numpy as np
 import math
+from nav2_msgs.action import ComputePathToPose
+
+from rclpy.action import ActionClient
 
 
 class ViewPointSampler(Node):
@@ -23,9 +27,10 @@ class ViewPointSampler(Node):
         self.map_frame_id = "map"
         self.base_footprint = "base_footprint"
         self.max_degree = 0.785 # 45 degrees
-        self.num_poses = 10
+        self.num_poses = 1
         self.num_d = 3
         self.d_variation = 0.3
+        self.action_client = ActionClient(self, ComputePathToPose, "/compute_path_to_pose")
 
     def sampling_cb(self, req, res):
         cam_info = req.cam_info
@@ -57,61 +62,74 @@ class ViewPointSampler(Node):
         transform.orientation.z = base_pose_map.orientation.z - cam_pose_map.orientation.z
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
         rpy = np.array([roll, pitch, yaw])
-
+        self.pose_list = []
+        self.futures = []
         for centroid in req.centroids:
-            dir = np.array([centroid.x, centroid.y, centroid.z]) - np.array([base_pose_map.position.x, base_pose_map.position.y, base_pose_map.position.z]) 
-            d = np.linalg.norm(np.array([centroid.x, centroid.y, centroid.z]) - np.array([base_pose_map.position.x, base_pose_map.position.y, base_pose_map.position.z]))
+            dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
+            d = np.linalg.norm(dir)
 
             for i in range(-(int) (self.num_d / 2), (int) (self.num_d/2 + 1)):
                 if i == 0:
                     d_var = 0
                 else:
                     d_var = d * (self.d_variation / i)
-                new_d = d + d_var
                 
                 for j in range(self.num_poses):
-                    start = dir / d - d_var # only move x and y not z! calculate start differently
-                    vec = start - np.array([centroid.x , centroid.y , centroid.z])
+                    start = np.array([base_pose_map.position.x, base_pose_map.position.y]) - (dir / d) * d_var  # only move x and y not z! calculate start differently
+                    vec = start - np.array([centroid.x , centroid.y])
                     theta = self.max_degree * (j + 1) / self.num_poses
-                    rot1 = np.array([[np.cos(theta), -np.sin(theta), 0],
-                                     [np.sin(theta), np.cos(theta), 0], 
-                                     [0 , 0, 1]])
+                    rot1 = np.array([[np.cos(theta), -np.sin(theta)],
+                                     [np.sin(theta), np.cos(theta)],])
 
-                    rot2 = np.array([[np.cos(-theta), -np.sin(-theta), 0],
-                                     [np.sin(-theta), np.cos(-theta), 0], 
-                                     [0 , 0, 1]])
-                    p1 = np.array([centroid.x, centroid.y, centroid.z]) + np.dot(rot1, vec)
-                    p2 = np.array([centroid.x, centroid.y, centroid.z]) + np.dot(rot2, vec)
+                    rot2 = np.array([[np.cos(-theta), -np.sin(-theta)],
+                                     [np.sin(-theta), np.cos(-theta)],]) 
+                    p1 = np.array([centroid.x, centroid.y]) + np.dot(rot1, vec)
+                    p2 = np.array([centroid.x, centroid.y]) + np.dot(rot2, vec)
                     rpy1 = rpy.copy()
                     rpy1[0] += theta
                     rpy2 = rpy.copy()
                     rpy2[0] -= theta
                     w,x,y,z = rpy_to_quaternion(rpy1[0], rpy1[1], rpy1[2])
+                    header = Header()
+                    header.frame_id = self.map_frame_id
+                    header.stamp = rclpy.time.Time()
                     pose_1 = Pose()
                     pose_1.position.x = p1[0]
                     pose_1.position.y = p1[1]
-                    pose_1.position.z = p1[2]
+                    pose_1.position.z = base_pose_map.position.z
                     pose_1.orientation.w = w
                     pose_1.orientation.x = x
                     pose_1.orientation.y = y
                     pose_1.orientation.z = z
                     # TODO: test if Pose is reachable and check if centroid is in view frustum
+                    goal = PoseStamped()
+                    goal.pose= pose_1
+                    goal.header = header
+                    action = ComputePathToPose()
+                    action.Goal.goal = goal
+                    action.Goal.use_start = False
+                    action.Goal.planner_id = "GridBased"
+                    future1 = self.action_client.send_goal_async(action)
+                    
                     res.view_points.append(pose_1)
                     w,x,y,z = rpy_to_quaternion(rpy2[0], rpy2[1], rpy2[2])
                     pose_2 = Pose()
                     pose_2.position.x = p2[0]
                     pose_2.position.y = p2[1]
-                    pose_2.position.z = p2[2]
+                    pose_2.position.z = base_pose_map.position.z
                     pose_2.orientation.w = w
                     pose_2.orientation.x = x
                     pose_2.orientation.y = y
                     pose_2.orientation.z = z
                     res.view_points.append(pose_2)
-                    # TODO: test if Pose is reachable
         return res
                     
-                    
+    def done_callback(self, future):
+        if future.result().accepted:
+            future.result().get_result_async().add_done_callback(self.get_res_callback)     
 
+    def get_res_callback(self, future):
+        result = future.result()
 
 
 
