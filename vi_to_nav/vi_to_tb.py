@@ -56,7 +56,7 @@ class ViewPointSampler(Node):
         transform.orientation.y = base_pose_map.orientation.y - cam_pose_map.orientation.y
         transform.orientation.z = base_pose_map.orientation.z - cam_pose_map.orientation.z
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
-        rpy = np.array([r,p,y])
+        rpy = np.array([roll, pitch, yaw])
 
         for centroid in req.centroids:
             dir = np.array([centroid.x, centroid.y, centroid.z]) - np.array([base_pose_map.position.x, base_pose_map.position.y, base_pose_map.position.z]) 
@@ -70,7 +70,7 @@ class ViewPointSampler(Node):
                 new_d = d + d_var
                 
                 for j in range(self.num_poses):
-                    start = dir / d - d_var
+                    start = dir / d - d_var # only move x and y not z! calculate start differently
                     vec = start - np.array([centroid.x , centroid.y , centroid.z])
                     theta = self.max_degree * (j + 1) / self.num_poses
                     rot1 = np.array([[np.cos(theta), -np.sin(theta), 0],
@@ -96,7 +96,7 @@ class ViewPointSampler(Node):
                     pose_1.orientation.y = y
                     pose_1.orientation.z = z
                     # TODO: test if Pose is reachable and check if centroid is in view frustum
-                    res.view_points.add(pose_1)
+                    res.view_points.append(pose_1)
                     w,x,y,z = rpy_to_quaternion(rpy2[0], rpy2[1], rpy2[2])
                     pose_2 = Pose()
                     pose_2.position.x = p2[0]
@@ -106,8 +106,9 @@ class ViewPointSampler(Node):
                     pose_2.orientation.x = x
                     pose_2.orientation.y = y
                     pose_2.orientation.z = z
-                    res.view_points.add(pose_2)
+                    res.view_points.append(pose_2)
                     # TODO: test if Pose is reachable
+        return res
                     
                     
 
