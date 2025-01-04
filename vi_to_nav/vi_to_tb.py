@@ -11,17 +11,22 @@ from std_msgs.msg import Header
 import numpy as np
 import math
 from nav2_msgs.action import ComputePathToPose
+import threading
+from rclpy.executors import MultiThreadedExecutor
+from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
+from functools import partial
 
 from rclpy.action import ActionClient
 
 
 class ViewPointSampler(Node):
 
-
-
     def __init__(self):
         super().__init__('view_point_sampler')
-        self.create_service(ViewPointSampling, 'vi_to_nav/view_point_sampling', self.sampling_cb)
+        self.cb_group = ReentrantCallbackGroup()
+        self.result_cb_group = MutuallyExclusiveCallbackGroup()
+        self.done_cb_group = MutuallyExclusiveCallbackGroup()
+        self.create_service(ViewPointSampling, 'vi_to_nav/view_point_sampling', self.sampling_cb, callback_group= self.cb_group)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.map_frame_id = "map"
@@ -30,7 +35,10 @@ class ViewPointSampler(Node):
         self.num_poses = 1
         self.num_d = 3
         self.d_variation = 0.3
+        self.deviation = 0.02
         self.action_client = ActionClient(self, ComputePathToPose, "/compute_path_to_pose")
+        self.counter_lock = threading.Lock()
+        self.cond = threading.Condition()
 
     def sampling_cb(self, req, res):
         cam_info = req.cam_info
@@ -61,9 +69,10 @@ class ViewPointSampler(Node):
         transform.orientation.y = base_pose_map.orientation.y - cam_pose_map.orientation.y
         transform.orientation.z = base_pose_map.orientation.z - cam_pose_map.orientation.z
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
+        self.get_logger().info(f"Base Map Pose {base_pose_map}")
         rpy = np.array([roll, pitch, yaw])
         self.pose_list = []
-        self.futures = []
+        self.future_count = 0
         for centroid in req.centroids:
             dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
             d = np.linalg.norm(dir)
@@ -86,13 +95,13 @@ class ViewPointSampler(Node):
                     p1 = np.array([centroid.x, centroid.y]) + np.dot(rot1, vec)
                     p2 = np.array([centroid.x, centroid.y]) + np.dot(rot2, vec)
                     rpy1 = rpy.copy()
-                    rpy1[0] += theta
+                    rpy1[2] += theta
                     rpy2 = rpy.copy()
-                    rpy2[0] -= theta
+                    rpy2[2] -= theta
                     w,x,y,z = rpy_to_quaternion(rpy1[0], rpy1[1], rpy1[2])
                     header = Header()
                     header.frame_id = self.map_frame_id
-                    header.stamp = rclpy.time.Time()
+                    header.stamp = self.get_clock().now().to_msg()
                     pose_1 = Pose()
                     pose_1.position.x = p1[0]
                     pose_1.position.y = p1[1]
@@ -101,17 +110,19 @@ class ViewPointSampler(Node):
                     pose_1.orientation.x = x
                     pose_1.orientation.y = y
                     pose_1.orientation.z = z
-                    # TODO: test if Pose is reachable and check if centroid is in view frustum
+                    # TODO: check if centroid is in view frustum
                     goal = PoseStamped()
                     goal.pose= pose_1
                     goal.header = header
-                    action = ComputePathToPose()
-                    action.Goal.goal = goal
-                    action.Goal.use_start = False
-                    action.Goal.planner_id = "GridBased"
+                    action = ComputePathToPose.Goal()
+                    action.goal = goal
+                    action.use_start = False
+                    action.planner_id = "GridBased"
                     future1 = self.action_client.send_goal_async(action)
+                    future1.add_done_callback(partial(self.done_callback, pose_1))
+                    with self.counter_lock:
+                        self.future_count += 1
                     
-                    res.view_points.append(pose_1)
                     w,x,y,z = rpy_to_quaternion(rpy2[0], rpy2[1], rpy2[2])
                     pose_2 = Pose()
                     pose_2.position.x = p2[0]
@@ -121,15 +132,54 @@ class ViewPointSampler(Node):
                     pose_2.orientation.x = x
                     pose_2.orientation.y = y
                     pose_2.orientation.z = z
-                    res.view_points.append(pose_2)
+                    with self.counter_lock:
+                        self.future_count += 1
+                    goal = PoseStamped()
+                    goal.pose= pose_2
+                    goal.header = header
+                    action = ComputePathToPose.Goal()
+                    action.goal = goal
+                    action.use_start = False
+                    action.planner_id = "GridBased"
+                    future2 = self.action_client.send_goal_async(action)
+                    future2.add_done_callback(partial(self.done_callback, pose_2))
+        
+        while True:
+            with self.counter_lock:
+                if self.future_count <= 0:
+                    break
+            with self.cond:
+                self.cond.wait()
+
+        res.view_points = self.pose_list
         return res
                     
-    def done_callback(self, future):
-        if future.result().accepted:
-            future.result().get_result_async().add_done_callback(self.get_res_callback)     
+    def done_callback(self, pose, future):
 
-    def get_res_callback(self, future):
-        result = future.result()
+        if future.result().accepted:
+            self.get_logger().info("Accepted")
+            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose))
+        else:
+            self.get_logger().info("Rejected")
+        
+
+    def get_res_callback(self, pose, future):
+        result = future.result().result
+        reached = False
+        reachable_pose = PoseStamped()
+        if len(result.path.poses) != 0:
+            reachable_pose = result.path.poses[len(result.path.poses) - 1]
+            reached = (np.abs(reachable_pose.pose.position.x - pose.position.x) < self.deviation) and (np.abs(reachable_pose.pose.position.y - pose.position.y) < self.deviation) and (reachable_pose.pose.position.z == 0.0) and np.abs(reachable_pose.pose.orientation.w - pose.orientation.w) / pose.orientation.w < self.deviation and np.abs(reachable_pose.pose.orientation.x - pose.orientation.x) < self.deviation and np.abs(reachable_pose.pose.orientation.y - pose.orientation.y) < self.deviation and np.abs(reachable_pose.pose.orientation.z - pose.orientation.z) < self.deviation
+        with self.counter_lock:
+            if reached:
+                self.pose_list.append(pose)
+            else:
+                self.get_logger().info(f"Target Pose {pose}")
+                self.get_logger().info(f"Reachable Pose {reachable_pose}")
+            self.future_count -= 1
+            if self.future_count <= 0:
+                with self.cond:
+                    self.cond.notify_all()
 
 
 
@@ -158,7 +208,9 @@ def rpy_to_quaternion(roll, pitch, yaw):
 def main(args=None):
     rclpy.init(args=args)
     node = ViewPointSampler()
-    rclpy.spin(node)
+    executor = MultiThreadedExecutor(num_threads = 2)
+    executor.add_node(node)
+    executor.spin()
     node.destroy_node()
     rclpy.shutdown()
 
