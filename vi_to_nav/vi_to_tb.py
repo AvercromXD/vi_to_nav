@@ -2,11 +2,12 @@ import rclpy
 from rclpy import qos
 from rclpy.node import Node
 from nbv_interfaces.srv import ViewPointSampling
+from nbv_interfaces.msg import CandidateView
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
 from tf2_ros import LookupException, ExtrapolationException, TransformException
 import tf2_geometry_msgs
-from geometry_msgs.msg import Transform, Pose, PoseStamped
+from geometry_msgs.msg import Transform, Pose, PoseStamped, Vector3, Vector3Stamped
 from std_msgs.msg import Header
 import numpy as np
 import math
@@ -24,8 +25,6 @@ class ViewPointSampler(Node):
     def __init__(self):
         super().__init__('view_point_sampler')
         self.cb_group = ReentrantCallbackGroup()
-        self.result_cb_group = MutuallyExclusiveCallbackGroup()
-        self.done_cb_group = MutuallyExclusiveCallbackGroup()
         self.create_service(ViewPointSampling, 'vi_to_nav/view_point_sampling', self.sampling_cb, callback_group= self.cb_group)
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -36,6 +35,8 @@ class ViewPointSampler(Node):
         self.num_d = 3
         self.d_variation = 0.3
         self.deviation = 0.02
+        self.near = 0.01
+        self.far = 10
         self.action_client = ActionClient(self, ComputePathToPose, "/compute_path_to_pose")
         self.counter_lock = threading.Lock()
         self.cond = threading.Condition()
@@ -70,9 +71,40 @@ class ViewPointSampler(Node):
         transform.orientation.z = base_pose_map.orientation.z - cam_pose_map.orientation.z
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
         self.get_logger().info(f"Base Map Pose {base_pose_map}")
+        self.get_logger().info(f"Diff Base Cam {transform}")
         rpy = np.array([roll, pitch, yaw])
         self.pose_list = []
         self.future_count = 0
+        try:
+            optical_to_map = self.tf_buffer.lookup_transform(self.map_frame_id, req.optical_frame, rclpy.time.Time())
+        except TransformException as ex:
+            self.get_logger().error(f"Failed to lookup transform from {self.base_footprint} to {self.map_frame_id}: {ex}")
+            return res
+
+        header = Header()
+        header.frame_id = req.optical_frame
+        header.stamp = cam_info.header.stamp
+        # right = +x, up = -y, look_dir=+z
+        up = Vector3(x = 0.0, y = -1.0, z = 0.0)
+        up = Vector3Stamped(vector = up, header = header)
+        up = tf2_geometry_msgs.do_transform_vector3(up, optical_to_map)
+
+        look_dir = Vector3(x = 0.0, y = 0.0, z = 1.0)
+        look_dir = Vector3Stamped(vector = look_dir, header = header)
+        look_dir = tf2_geometry_msgs.do_transform_vector3(look_dir, optical_to_map)
+
+        view_dir = np.array([look_dir.vector.x, look_dir.vector.y, look_dir.vector.z])
+        view_dir /= np.linalg.norm(view_dir)
+        up_dir = np.array([up.vector.x, up.vector.y, up.vector.z])
+        up_dir /= np.linalg.norm(up_dir)
+        self.get_logger().info(f"up {up_dir}")
+        self.get_logger().info(f"view {view_dir}")
+
+        tan_fov_x = np.tan(np.arctan2(cam_info.width/2, cam_info.k[0]))
+        tan_fov_y = np.tan(np.arctan2(cam_info.height/2, cam_info.k[4]))
+
+        self.get_logger().info("Checking centroids")
+
         for centroid in req.centroids:
             dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
             d = np.linalg.norm(dir)
@@ -84,66 +116,13 @@ class ViewPointSampler(Node):
                     d_var = d * (self.d_variation / i)
                 
                 for j in range(self.num_poses):
-                    start = np.array([base_pose_map.position.x, base_pose_map.position.y]) - (dir / d) * d_var  # only move x and y not z! calculate start differently
+                    start = np.array([base_pose_map.position.x, base_pose_map.position.y]) - (dir / d) * d_var
                     vec = start - np.array([centroid.x , centroid.y])
                     theta = self.max_degree * (j + 1) / self.num_poses
-                    rot1 = np.array([[np.cos(theta), -np.sin(theta)],
-                                     [np.sin(theta), np.cos(theta)],])
+                    self.handle_pose(theta, vec, base_pose_map, centroid, rpy, transform, up_dir, view_dir, tan_fov_x, tan_fov_y)
+                    self.handle_pose(-theta, vec, base_pose_map, centroid, rpy, transform, up_dir, view_dir, tan_fov_x, tan_fov_y)
 
-                    rot2 = np.array([[np.cos(-theta), -np.sin(-theta)],
-                                     [np.sin(-theta), np.cos(-theta)],]) 
-                    p1 = np.array([centroid.x, centroid.y]) + np.dot(rot1, vec)
-                    p2 = np.array([centroid.x, centroid.y]) + np.dot(rot2, vec)
-                    rpy1 = rpy.copy()
-                    rpy1[2] += theta
-                    rpy2 = rpy.copy()
-                    rpy2[2] -= theta
-                    w,x,y,z = rpy_to_quaternion(rpy1[0], rpy1[1], rpy1[2])
-                    header = Header()
-                    header.frame_id = self.map_frame_id
-                    header.stamp = self.get_clock().now().to_msg()
-                    pose_1 = Pose()
-                    pose_1.position.x = p1[0]
-                    pose_1.position.y = p1[1]
-                    pose_1.position.z = base_pose_map.position.z
-                    pose_1.orientation.w = w
-                    pose_1.orientation.x = x
-                    pose_1.orientation.y = y
-                    pose_1.orientation.z = z
-                    # TODO: check if centroid is in view frustum
-                    goal = PoseStamped()
-                    goal.pose= pose_1
-                    goal.header = header
-                    action = ComputePathToPose.Goal()
-                    action.goal = goal
-                    action.use_start = False
-                    action.planner_id = "GridBased"
-                    future1 = self.action_client.send_goal_async(action)
-                    future1.add_done_callback(partial(self.done_callback, pose_1))
-                    with self.counter_lock:
-                        self.future_count += 1
-                    
-                    w,x,y,z = rpy_to_quaternion(rpy2[0], rpy2[1], rpy2[2])
-                    pose_2 = Pose()
-                    pose_2.position.x = p2[0]
-                    pose_2.position.y = p2[1]
-                    pose_2.position.z = base_pose_map.position.z
-                    pose_2.orientation.w = w
-                    pose_2.orientation.x = x
-                    pose_2.orientation.y = y
-                    pose_2.orientation.z = z
-                    with self.counter_lock:
-                        self.future_count += 1
-                    goal = PoseStamped()
-                    goal.pose= pose_2
-                    goal.header = header
-                    action = ComputePathToPose.Goal()
-                    action.goal = goal
-                    action.use_start = False
-                    action.planner_id = "GridBased"
-                    future2 = self.action_client.send_goal_async(action)
-                    future2.add_done_callback(partial(self.done_callback, pose_2))
-        
+        self.get_logger().info("Waiting for futures") 
         while True:
             with self.counter_lock:
                 if self.future_count <= 0:
@@ -152,27 +131,99 @@ class ViewPointSampler(Node):
                 self.cond.wait()
 
         res.view_points = self.pose_list
+        res.diff_base_cam = transform
+        self.get_logger().info("Done")
         return res
+
+    def handle_pose(self, theta, vec, base_pose_map, centroid, rpy, transform, up, look_dir, tan_fov_x, tan_fov_y):
+        rot = np.array([[np.cos(theta), -np.sin(theta)],
+                        [np.sin(theta), np.cos(theta)],])
+
+        p = np.array([centroid.x, centroid.y]) + np.dot(rot, vec)
+        rpy1 = rpy.copy()
+
+        cam_pos = np.array([p[0] - transform.position.x, p[1] - transform.position.y, base_pose_map.position.z - transform.position.z])
+        alpha = np.arccos(np.dot(np.array([centroid.x, centroid.y]) - np.array([cam_pos[0], cam_pos[1]]), np.array([look_dir[0], look_dir[1]])) / np.linalg.norm(np.array([centroid.x, centroid.y]) - np.array([cam_pos[0], cam_pos[1]])))
+        if theta < 0:
+            alpha = alpha * -1
+        rpy1[2] += alpha 
+        w,x,y,z = rpy_to_quaternion(rpy1[0], rpy1[1], rpy1[2])
+        header = Header()
+        header.frame_id = self.map_frame_id
+        header.stamp = self.get_clock().now().to_msg()
+        pose = Pose()
+        pose.position.x = p[0]
+        pose.position.y = p[1]
+        pose.position.z = base_pose_map.position.z
+        pose.orientation.w = w
+        pose.orientation.x = x
+        pose.orientation.y = y
+        pose.orientation.z = z
+
+        cam_pos = np.array([pose.position.x - transform.position.x, pose.position.y - transform.position.y, pose.position.z - transform.position.z])
+        point_rel = np.array([centroid.x, centroid.y, centroid.z]) - cam_pos
+        rot_alpha = np.array([[np.cos(alpha), -np.sin(alpha)],
+                        [np.sin(alpha), np.cos(alpha)],])
+        new_look_dir = np.dot(rot_alpha, np.array([look_dir[0], look_dir[1]]))
+        new_look_dir = np.array([new_look_dir[0], new_look_dir[1], look_dir[2]])
+        dist = np.dot(point_rel, new_look_dir)
+        if dist < self.near or dist > self.far:
+            self.get_logger().info(f"Too far or too near, {dist}")
+            return
+
+        right_proj = np.dot(point_rel, np.cross(new_look_dir, up))
+        up_proj = np.dot(point_rel, up)
+        width_at_dist = 2 * dist * tan_fov_x
+        height_at_dist = 2 * dist * tan_fov_y
+        if np.abs(up_proj) > height_at_dist / 2:
+            self.get_logger().info(f"Too hight/low, {up_proj}")
+            return
+        if np.abs(right_proj) > width_at_dist / 2:
+            self.get_logger().info(f"Too left/right, {right_proj}")
+            return
+        self.get_logger().info("Centroid is in frustum")
+        goal = PoseStamped()    
+        goal.pose= pose
+        goal.header = header
+        action = ComputePathToPose.Goal()
+        action.goal = goal
+        action.use_start = False
+        action.planner_id = "GridBased"
+        with self.counter_lock:
+            self.future_count += 1
+        future1 = self.action_client.send_goal_async(action)
+        future1.add_done_callback(partial(self.done_callback, pose, transform))
                     
-    def done_callback(self, pose, future):
+    def done_callback(self, pose, transform, future):
 
         if future.result().accepted:
             self.get_logger().info("Accepted")
-            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose))
+            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose, transform))
         else:
             self.get_logger().info("Rejected")
         
 
-    def get_res_callback(self, pose, future):
+    def get_res_callback(self, pose, transform, future):
         result = future.result().result
         reached = False
         reachable_pose = PoseStamped()
+        d = 0
         if len(result.path.poses) != 0:
             reachable_pose = result.path.poses[len(result.path.poses) - 1]
             reached = (np.abs(reachable_pose.pose.position.x - pose.position.x) < self.deviation) and (np.abs(reachable_pose.pose.position.y - pose.position.y) < self.deviation) and (reachable_pose.pose.position.z == 0.0) and np.abs(reachable_pose.pose.orientation.w - pose.orientation.w) / pose.orientation.w < self.deviation and np.abs(reachable_pose.pose.orientation.x - pose.orientation.x) < self.deviation and np.abs(reachable_pose.pose.orientation.y - pose.orientation.y) < self.deviation and np.abs(reachable_pose.pose.orientation.z - pose.orientation.z) < self.deviation
+            if reached:
+                prev = result.path.poses[0]
+                for p in result.path.poses:
+                    np_p = np.array([p.pose.position.x, p.pose.position.y, p.pose.position.z, p.pose.orientation.w, p.pose.orientation.x, p.pose.orientation.y, p.pose.orientation.z])
+                    np_prev = np.array([prev.pose.position.x, prev.pose.position.y, prev.pose.position.z, prev.pose.orientation.w, prev.pose.orientation.x, prev.pose.orientation.y, prev.pose.orientation.z])
+                    d += np.linalg.norm(np_p - np_prev)
+                    prev = p
         with self.counter_lock:
             if reached:
-                self.pose_list.append(pose)
+                res = CandidateView()
+                res.view_point = pose
+                res.d = d
+                self.pose_list.append(res)
             else:
                 self.get_logger().info(f"Target Pose {pose}")
                 self.get_logger().info(f"Reachable Pose {reachable_pose}")

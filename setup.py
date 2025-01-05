@@ -24,7 +24,8 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
-            'vi_to_tb = vi_to_nav.vi_to_tb:main'
+            'vi_to_tb = vi_to_nav.vi_to_tb:main',
+            'test = vi_to_nav.service_client_test:main'
         ],
     },
 )
