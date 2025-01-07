@@ -60,18 +60,14 @@ class ViewPointSampler(Node):
         zero_pose.position.z = 0.0
         cam_pose_map = tf2_geometry_msgs.do_transform_pose(zero_pose, cam_to_map)
         base_pose_map = tf2_geometry_msgs.do_transform_pose(zero_pose, self.base_to_map)
-        transform = Pose()
-        transform.position.x = base_pose_map.position.x - cam_pose_map.position.x
-        transform.position.y = base_pose_map.position.y - cam_pose_map.position.y
-        transform.position.z = base_pose_map.position.z - cam_pose_map.position.z
-
-        transform.orientation.w = base_pose_map.orientation.w - cam_pose_map.orientation.w
-        transform.orientation.x = base_pose_map.orientation.x - cam_pose_map.orientation.x
-        transform.orientation.y = base_pose_map.orientation.y - cam_pose_map.orientation.y
-        transform.orientation.z = base_pose_map.orientation.z - cam_pose_map.orientation.z
+        self.transform = Pose()
+        self.transform.position.x = cam_pose_map.position.x - base_pose_map.position.x
+        self.transform.position.y = cam_pose_map.position.y - base_pose_map.position.y
+        self.transform.position.z = cam_pose_map.position.z - base_pose_map.position.z
+        
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
         self.get_logger().info(f"Base Map Pose {base_pose_map}")
-        self.get_logger().info(f"Diff Base Cam {transform}")
+
         rpy = np.array([roll, pitch, yaw])
         self.pose_list = []
         self.future_count = 0
@@ -108,6 +104,7 @@ class ViewPointSampler(Node):
         for centroid in req.centroids:
             dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
             d = np.linalg.norm(dir)
+            self.get_logger().info(f"Centroid: {centroid}")
 
             for i in range(-(int) (self.num_d / 2), (int) (self.num_d/2 + 1)):
                 if i == 0:
@@ -119,8 +116,8 @@ class ViewPointSampler(Node):
                     start = np.array([base_pose_map.position.x, base_pose_map.position.y]) - (dir / d) * d_var
                     vec = start - np.array([centroid.x , centroid.y])
                     theta = self.max_degree * (j + 1) / self.num_poses
-                    self.handle_pose(theta, vec, base_pose_map, centroid, rpy, transform, up_dir, view_dir, tan_fov_x, tan_fov_y)
-                    self.handle_pose(-theta, vec, base_pose_map, centroid, rpy, transform, up_dir, view_dir, tan_fov_x, tan_fov_y)
+                    self.handle_pose(theta, vec, base_pose_map, centroid, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
+                    self.handle_pose(-theta, vec, base_pose_map, centroid, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
 
         self.get_logger().info("Waiting for futures") 
         while True:
@@ -131,18 +128,17 @@ class ViewPointSampler(Node):
                 self.cond.wait()
 
         res.view_points = self.pose_list
-        res.diff_base_cam = transform
         self.get_logger().info("Done")
         return res
 
-    def handle_pose(self, theta, vec, base_pose_map, centroid, rpy, transform, up, look_dir, tan_fov_x, tan_fov_y):
+    def handle_pose(self, theta, vec, base_pose_map, centroid, rpy, up, look_dir, tan_fov_x, tan_fov_y):
         rot = np.array([[np.cos(theta), -np.sin(theta)],
                         [np.sin(theta), np.cos(theta)],])
 
         p = np.array([centroid.x, centroid.y]) + np.dot(rot, vec)
         rpy1 = rpy.copy()
 
-        cam_pos = np.array([p[0] - transform.position.x, p[1] - transform.position.y, base_pose_map.position.z - transform.position.z])
+        cam_pos = np.array([p[0] + self.transform.position.x, p[1] + self.transform.position.y, base_pose_map.position.z + self.transform.position.z])
         alpha = np.arccos(np.dot(np.array([centroid.x, centroid.y]) - np.array([cam_pos[0], cam_pos[1]]), np.array([look_dir[0], look_dir[1]])) / np.linalg.norm(np.array([centroid.x, centroid.y]) - np.array([cam_pos[0], cam_pos[1]])))
         if theta < 0:
             alpha = alpha * -1
@@ -160,7 +156,6 @@ class ViewPointSampler(Node):
         pose.orientation.y = y
         pose.orientation.z = z
 
-        cam_pos = np.array([pose.position.x - transform.position.x, pose.position.y - transform.position.y, pose.position.z - transform.position.z])
         point_rel = np.array([centroid.x, centroid.y, centroid.z]) - cam_pos
         rot_alpha = np.array([[np.cos(alpha), -np.sin(alpha)],
                         [np.sin(alpha), np.cos(alpha)],])
@@ -192,18 +187,18 @@ class ViewPointSampler(Node):
         with self.counter_lock:
             self.future_count += 1
         future1 = self.action_client.send_goal_async(action)
-        future1.add_done_callback(partial(self.done_callback, pose, transform))
+        future1.add_done_callback(partial(self.done_callback, pose))
                     
-    def done_callback(self, pose, transform, future):
+    def done_callback(self, pose, future):
 
         if future.result().accepted:
             self.get_logger().info("Accepted")
-            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose, transform))
+            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose))
         else:
             self.get_logger().info("Rejected")
         
 
-    def get_res_callback(self, pose, transform, future):
+    def get_res_callback(self, pose, future):
         result = future.result().result
         reached = False
         reachable_pose = PoseStamped()
@@ -221,8 +216,12 @@ class ViewPointSampler(Node):
         with self.counter_lock:
             if reached:
                 res = CandidateView()
-                res.view_point = pose
                 res.d = d
+                res.cam_pose = pose
+                res.cam_pose.position.x += self.transform.position.x
+                res.cam_pose.position.y += self.transform.position.y
+                res.cam_pose.position.z += self.transform.position.z
+                # Orientation not important because tb cam has same orientation as base
                 self.pose_list.append(res)
             else:
                 self.get_logger().info(f"Target Pose {pose}")
@@ -252,6 +251,12 @@ def rpy_to_quaternion(roll, pitch, yaw):
     y = cr * sp * cy + sr * cp * sy
     z = cr * cp * sy - sr * sp * cy
     return w, x, y, z
+
+def invert_quaternion(w, x, y, z):
+    return w, -x, -y, -z
+
+def quaternion_multiply(w1, x1, y1, z1, w2, x2, y2, z2):
+    return w1*w2 - x1*x2 - y1*y2 - z1*z2, w1*x2 + w2*x1 + y1*z2 - z1*y2, w1*y2 + w2*y1 - x1*z2 + x2*z1, w1*z2 + w2*z1 + x1*y2 - x2*y1
 
 
 

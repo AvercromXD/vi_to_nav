@@ -146,6 +146,14 @@ def generate_launch_description():
             parameters = [config],
             output='screen'
             )
+    
+    vi_to_tb = Node(
+            package="vi_to_nav",
+            executable='vi_to_tb',
+            name='vi_to_tb',
+            parameters= [],
+            output='screen'
+        )
 
 
     sim_cmd = IncludeLaunchDescription(
@@ -199,6 +207,7 @@ def generate_launch_description():
 
     ld.add_action(nbv)
     ld.add_action(sim_cmd)
+    ld.add_action(vi_to_tb)
 
     ld.add_action(rviz_cmd)
     ld.add_action(bringup_cmd)
