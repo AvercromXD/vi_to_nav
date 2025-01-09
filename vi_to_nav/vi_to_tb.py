@@ -3,6 +3,7 @@ from rclpy import qos
 from rclpy.node import Node
 from nbv_interfaces.srv import ViewPointSampling
 from nbv_interfaces.msg import CandidateView
+from nbv_interfaces.action import MoveToPose
 from tf2_ros.transform_listener import TransformListener
 from tf2_ros.buffer import Buffer
 from tf2_ros import LookupException, ExtrapolationException, TransformException
@@ -11,13 +12,13 @@ from geometry_msgs.msg import Transform, Pose, PoseStamped, Vector3, Vector3Stam
 from std_msgs.msg import Header
 import numpy as np
 import math
-from nav2_msgs.action import ComputePathToPose
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
 import threading
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.callback_groups import ReentrantCallbackGroup, MutuallyExclusiveCallbackGroup
 from functools import partial
 
-from rclpy.action import ActionClient
+from rclpy.action import ActionClient, ActionServer
 
 
 class ViewPointSampler(Node):
@@ -40,6 +41,7 @@ class ViewPointSampler(Node):
         self.action_client = ActionClient(self, ComputePathToPose, "/compute_path_to_pose")
         self.counter_lock = threading.Lock()
         self.cond = threading.Condition()
+
 
     def sampling_cb(self, req, res):
         cam_info = req.cam_info
@@ -101,7 +103,8 @@ class ViewPointSampler(Node):
 
         self.get_logger().info("Checking centroids")
 
-        for centroid in req.centroids:
+        for c in req.centroids:
+            centroid = c.pos
             dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
             d = np.linalg.norm(dir)
             self.get_logger().info(f"Centroid: {centroid}")
@@ -116,8 +119,8 @@ class ViewPointSampler(Node):
                     start = np.array([base_pose_map.position.x, base_pose_map.position.y]) - (dir / d) * d_var
                     vec = start - np.array([centroid.x , centroid.y])
                     theta = self.max_degree * (j + 1) / self.num_poses
-                    self.handle_pose(theta, vec, base_pose_map, centroid, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
-                    self.handle_pose(-theta, vec, base_pose_map, centroid, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
+                    self.handle_pose(theta, vec, base_pose_map, c, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
+                    self.handle_pose(-theta, vec, base_pose_map, c, rpy, up_dir, view_dir, tan_fov_x, tan_fov_y)
 
         self.get_logger().info("Waiting for futures") 
         while True:
@@ -131,7 +134,8 @@ class ViewPointSampler(Node):
         self.get_logger().info("Done")
         return res
 
-    def handle_pose(self, theta, vec, base_pose_map, centroid, rpy, up, look_dir, tan_fov_x, tan_fov_y):
+    def handle_pose(self, theta, vec, base_pose_map, c, rpy, up, look_dir, tan_fov_x, tan_fov_y):
+        centroid = c.pos
         rot = np.array([[np.cos(theta), -np.sin(theta)],
                         [np.sin(theta), np.cos(theta)],])
 
@@ -184,28 +188,32 @@ class ViewPointSampler(Node):
         action.goal = goal
         action.use_start = False
         action.planner_id = "GridBased"
+        candidate = CandidateView()
+        candidate.cam_pose = pose
+        candidate.centroid = c
         with self.counter_lock:
             self.future_count += 1
         future1 = self.action_client.send_goal_async(action)
-        future1.add_done_callback(partial(self.done_callback, pose))
+        future1.add_done_callback(partial(self.done_callback, candidate))
                     
-    def done_callback(self, pose, future):
+    def done_callback(self, candidate, future):
 
         if future.result().accepted:
             self.get_logger().info("Accepted")
-            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, pose))
+            future.result().get_result_async().add_done_callback(partial(self.get_res_callback, candidate))
         else:
             self.get_logger().info("Rejected")
         
 
-    def get_res_callback(self, pose, future):
+    def get_res_callback(self, candidate, future):
+        pose = candidate.cam_pose
         result = future.result().result
         reached = False
         reachable_pose = PoseStamped()
         d = 0
         if len(result.path.poses) != 0:
             reachable_pose = result.path.poses[len(result.path.poses) - 1]
-            reached = (np.abs(reachable_pose.pose.position.x - pose.position.x) < self.deviation) and (np.abs(reachable_pose.pose.position.y - pose.position.y) < self.deviation) and (reachable_pose.pose.position.z == 0.0) and np.abs(reachable_pose.pose.orientation.w - pose.orientation.w) / pose.orientation.w < self.deviation and np.abs(reachable_pose.pose.orientation.x - pose.orientation.x) < self.deviation and np.abs(reachable_pose.pose.orientation.y - pose.orientation.y) < self.deviation and np.abs(reachable_pose.pose.orientation.z - pose.orientation.z) < self.deviation
+            reached = (np.abs(reachable_pose.pose.position.x - pose.position.x) < self.deviation) and (np.abs(reachable_pose.pose.position.y - pose.position.y) < self.deviation) and (reachable_pose.pose.position.z == 0.0) and np.abs(reachable_pose.pose.orientation.w - pose.orientation.w) < self.deviation and np.abs(reachable_pose.pose.orientation.x - pose.orientation.x) < self.deviation and np.abs(reachable_pose.pose.orientation.y - pose.orientation.y) < self.deviation and np.abs(reachable_pose.pose.orientation.z - pose.orientation.z) < self.deviation
             if reached:
                 prev = result.path.poses[0]
                 for p in result.path.poses:
@@ -215,14 +223,12 @@ class ViewPointSampler(Node):
                     prev = p
         with self.counter_lock:
             if reached:
-                res = CandidateView()
-                res.d = d
-                res.cam_pose = pose
-                res.cam_pose.position.x += self.transform.position.x
-                res.cam_pose.position.y += self.transform.position.y
-                res.cam_pose.position.z += self.transform.position.z
+                candidate.d = d
+                candidate.cam_pose.position.x += self.transform.position.x
+                candidate.cam_pose.position.y += self.transform.position.y
+                candidate.cam_pose.position.z += self.transform.position.z
                 # Orientation not important because tb cam has same orientation as base
-                self.pose_list.append(res)
+                self.pose_list.append(candidate)
             else:
                 self.get_logger().info(f"Target Pose {pose}")
                 self.get_logger().info(f"Reachable Pose {reachable_pose}")
