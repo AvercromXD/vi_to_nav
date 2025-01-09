@@ -17,20 +17,14 @@
     visualization_rate: 2.0
 
     # Sensor input
-    accumulate_updates: true
+    accumulate_updates: false
     accumulation_period: 0.2
 
     apply_raw_sensor_data: true
-    sources: [camera,lidar]
-    #camera:
-    #  topic: /camera/points
-    #  sensor_origin_frame: camera_frame
+    sources: [camera]
     camera:
       topic: /camera/points
       sensor_origin_frame: camera_frame
-    lidar:
-      topic: /scan/points
-      sensor_origin_frame: base_scan
 
     # Remote mapping
     publish_updates: true

@@ -136,8 +136,8 @@ def generate_launch_description():
     config = os.path.join(
             get_package_share_directory('vi_to_nav'),
             'config',
-            'vdb_params_virtual.yaml'
-            #'vdb_params.yaml'
+            #'vdb_params_virtual.yaml'
+            'vdb_params.yaml'
             )
 
     nbv = Node(
