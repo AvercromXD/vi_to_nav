@@ -68,7 +68,6 @@ class ViewPointSampler(Node):
         self.transform.position.z = cam_pose_map.position.z - base_pose_map.position.z
         
         roll,pitch,yaw = quaternion_to_euler(base_pose_map.orientation.w, base_pose_map.orientation.x, base_pose_map.orientation.y, base_pose_map.orientation.z)
-        self.get_logger().info(f"Base Map Pose {base_pose_map}")
 
         rpy = np.array([roll, pitch, yaw])
         self.pose_list = []
@@ -95,8 +94,6 @@ class ViewPointSampler(Node):
         view_dir /= np.linalg.norm(view_dir)
         up_dir = np.array([up.vector.x, up.vector.y, up.vector.z])
         up_dir /= np.linalg.norm(up_dir)
-        self.get_logger().info(f"up {up_dir}")
-        self.get_logger().info(f"view {view_dir}")
 
         tan_fov_x = np.tan(np.arctan2(cam_info.width/2, cam_info.k[0]))
         tan_fov_y = np.tan(np.arctan2(cam_info.height/2, cam_info.k[4]))
@@ -107,7 +104,6 @@ class ViewPointSampler(Node):
             centroid = c.pos
             dir = np.array([centroid.x, centroid.y]) - np.array([base_pose_map.position.x, base_pose_map.position.y]) 
             d = np.linalg.norm(dir)
-            self.get_logger().info(f"Centroid: {centroid}")
 
             for i in range(-(int) (self.num_d / 2), (int) (self.num_d/2 + 1)):
                 if i == 0:
@@ -197,13 +193,8 @@ class ViewPointSampler(Node):
         future1.add_done_callback(partial(self.done_callback, candidate))
                     
     def done_callback(self, candidate, future):
-
         if future.result().accepted:
-            self.get_logger().info("Accepted")
             future.result().get_result_async().add_done_callback(partial(self.get_res_callback, candidate))
-        else:
-            self.get_logger().info("Rejected")
-        
 
     def get_res_callback(self, candidate, future):
         pose = candidate.cam_pose
@@ -229,9 +220,6 @@ class ViewPointSampler(Node):
                 candidate.cam_pose.position.z += self.transform.position.z
                 # Orientation not important because tb cam has same orientation as base
                 self.pose_list.append(candidate)
-            else:
-                self.get_logger().info(f"Target Pose {pose}")
-                self.get_logger().info(f"Reachable Pose {reachable_pose}")
             self.future_count -= 1
             if self.future_count <= 0:
                 with self.cond:
